@@ -1,8 +1,8 @@
-# 用户配置（不提交）
+﻿# 鐢ㄦ埛閰嶇疆锛堜笉鎻愪氦锛?
 extension/email-config.js
 extension/config.js
 
-# 备份文件
+# 澶囦唤鏂囦欢
 *.backup.js
 *.bak
 
@@ -47,6 +47,26 @@ tmp/
 temp/
 *.tmp
 
-# API keys and secrets (额外保护)
+# API keys and secrets (棰濆淇濇姢)
 **/secrets.js
 **/keys.js
+
+# Local debug / temp artifacts (do not commit)
+CLOUDFLARE_GUIDE.md
+UPDATE_GUIDE.md
+api-server.js
+quick-debug.js
+start-server.bat
+test-1secmail.html
+test-email-services.html
+package.json
+extension/cloudflare-helper.js
+extension/debug-verification.html
+extension/network-test.html
+extension/test-config.html
+extension/test-new-email.html
+extension/test-real-api.html
+extension/test-verification.html
+extension/utils/temp-mail-client-backup.js
+extension/utils/temp-mail-client-new.js
+extension/utils/test-mail-simulator.js
