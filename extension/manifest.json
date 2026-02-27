@@ -21,7 +21,11 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://windsurf.com/account/register*"],
+      "matches": [
+        "https://windsurf.com/account/register*",
+        "https://windsurf.com/windsurf/signin*",
+        "https://codeium.com/windsurf/signin*"
+      ],
       "js": ["content/content-script.js"],
       "run_at": "document_idle"
     }

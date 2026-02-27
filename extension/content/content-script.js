@@ -1,32 +1,41 @@
-console.log('[Windsurf Helper] Content script loaded (v2.0)');
+﻿console.log('[Windsurf Helper] Content script loaded (v2.0)');
 
 function isWindsurfRegistrationPage(url) {
   if (!url) return false;
-  
-  const standardPatterns = [
-    'windsurf.com/account/register'
-  ];
-  
-  const oauthPatterns = [
-    'windsurf.com/windsurf/signin',
-    'workflow=onboarding',
-    'prompt=login'
-  ];
-  
-  for (const pattern of standardPatterns) {
-    if (url.includes(pattern)) {
+
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+
+    const isSupportedHost =
+      host === 'windsurf.com' ||
+      host.endsWith('.windsurf.com') ||
+      host === 'codeium.com' ||
+      host.endsWith('.codeium.com');
+
+    if (!isSupportedHost) return false;
+
+    if (path.startsWith('/account/register')) {
       return true;
     }
-  }
-  
-  let oauthMatchCount = 0;
-  for (const pattern of oauthPatterns) {
-    if (url.includes(pattern)) {
-      oauthMatchCount++;
+
+    if (path.startsWith('/windsurf/signin')) {
+      const workflow = (parsed.searchParams.get('workflow') || '').toLowerCase();
+      const prompt = (parsed.searchParams.get('prompt') || '').toLowerCase();
+      return workflow === 'onboarding' || prompt === 'login' || parsed.search.toLowerCase().includes('onboarding');
     }
+  } catch (e) {
+    return (
+      url.includes('windsurf.com/account/register') ||
+      (
+        (url.includes('windsurf.com/windsurf/signin') || url.includes('codeium.com/windsurf/signin')) &&
+        (url.includes('workflow=onboarding') || url.includes('prompt=login'))
+      )
+    );
   }
-  
-  return oauthMatchCount >= 2;
+
+  return false;
 }
 
 const CONFIG = {
@@ -34,11 +43,13 @@ const CONFIG = {
   ELEMENT_CHECK_INTERVAL: 100,
   MAX_RETRY_ATTEMPTS: 3,
   RETRY_DELAY: 2000,
-  CLOUDFLARE_TIMEOUT: 30000
+  CLOUDFLARE_TIMEOUT: 180000
 };
 
 let activeIntervals = [];
 let activeTimeouts = [];
+let cloudflareWatchActive = false;
+let cloudflareObserver = null;
 
 function waitForElement(selector, timeout = CONFIG.MAX_WAIT_TIME) {
   return new Promise((resolve, reject) => {
@@ -172,9 +183,9 @@ function detectCurrentStep() {
 
 function detectOAuthPageStep() {
   const url = window.location.href;
-  
-  if (url.includes('windsurf.com/windsurf/signin') && 
-      url.includes('workflow=onboarding')) {
+
+  if ((url.includes('windsurf.com/windsurf/signin') || url.includes('codeium.com/windsurf/signin')) &&
+      (url.includes('workflow=onboarding') || url.includes('prompt=login'))) {
     
     const emailInputs = document.querySelectorAll('input[type="email"]');
     const passwordInputs = document.querySelectorAll('input[type="password"]');
@@ -386,6 +397,11 @@ async function fillStep2(data) {
 }
 
 function waitForCloudflareAndSubmit() {
+  if (cloudflareWatchActive) {
+    console.log('[Content] Cloudflare监听已在运行，跳过重复启动');
+    return;
+  }
+  cloudflareWatchActive = true;
   console.log('[Content] 开始监听Cloudflare验证状态...');
   
   const checkInterval = setInterval(() => {
@@ -398,6 +414,7 @@ function waitForCloudflareAndSubmit() {
     if (continueBtn) {
       clearInterval(checkInterval);
       removeFromActiveIntervals(checkInterval);
+      cloudflareWatchActive = false;
       console.log('[Content] Cloudflare验证完成');
       
       const submitTimeout = setTimeout(() => {
@@ -417,9 +434,7 @@ function waitForCloudflareAndSubmit() {
   activeIntervals.push(checkInterval);
   
   const timeoutHandler = setTimeout(() => {
-    clearInterval(checkInterval);
-    removeFromActiveIntervals(checkInterval);
-    console.log('[Content] Cloudflare验证等待中（需要手动完成）');
+    console.log('[Content] Cloudflare验证耗时较长，继续监听中...');
     
     chrome.runtime.sendMessage({
       action: 'cloudflareWaiting',
@@ -442,6 +457,7 @@ function cleanupTimers() {
   activeTimeouts.forEach(timeout => clearTimeout(timeout));
   activeIntervals = [];
   activeTimeouts = [];
+  cloudflareWatchActive = false;
   console.log('[Content] 已清理所有定时器');
 }
 
@@ -502,6 +518,7 @@ async function fillOAuthFull(data) {
   
   await checkTermsCheckbox();
   await clickOAuthSubmitButton();
+  waitForCloudflareAndSubmit();
   
   console.log('[Content] OAuth完整页面填充完成');
 }
@@ -631,6 +648,232 @@ async function clickOAuthSubmitButton() {
   }
 }
 
+function normalizeActionText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isClickableActionElement(el) {
+  if (!el) return false;
+  if (el.disabled) return false;
+  if (el.getAttribute('aria-disabled') === 'true') return false;
+
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') {
+    return false;
+  }
+  return el.getClientRects().length > 0;
+}
+
+function findCloudflareActionButton() {
+  const selectors = [
+    'button',
+    '[role=\"button\"]',
+    'input[type=\"submit\"]',
+    'input[type=\"button\"]',
+    'a[role=\"button\"]'
+  ];
+  const positive = ['continue', 'next', 'submit', 'register', 'create', '继续', '下一步', '提交', '注册', '创建'];
+  const negative = ['back', 'cancel', 'return', '返回', '取消', '上一步'];
+
+  const elements = Array.from(document.querySelectorAll(selectors.join(',')))
+    .filter(isClickableActionElement);
+
+  for (const el of elements) {
+    const text = normalizeActionText(
+      el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title')
+    );
+    if (!text) continue;
+    if (positive.some(k => text.includes(k)) && !negative.some(k => text.includes(k))) {
+      return el;
+    }
+  }
+
+  return null;
+}
+
+function findContinueLikeButton() {
+  const selectors = [
+    'button',
+    '[role="button"]',
+    'input[type="submit"]',
+    'input[type="button"]'
+  ];
+
+  const keywords = ['continue', 'next', 'submit', '继续', '下一步', '提交'];
+  const candidates = Array.from(document.querySelectorAll(selectors.join(',')))
+    .filter(isClickableActionElement);
+
+  for (const el of candidates) {
+    const text = normalizeActionText(
+      el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title')
+    );
+    if (!text) continue;
+    if (keywords.some(k => text.includes(k))) {
+      return el;
+    }
+  }
+  return null;
+}
+
+function hasHumanCheckPrompt() {
+  const text = normalizeActionText(document.body?.innerText || '');
+  return (
+    text.includes('请确认你是人类') ||
+    text.includes('verify you are human') ||
+    text.includes('i am human')
+  );
+}
+
+function tryAutoContinueAfterCloudflare(source = 'unknown') {
+  const actionButton = findCloudflareActionButton();
+  if (!actionButton) return false;
+
+  // Try richer mouse sequence before native click.
+  actionButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+  actionButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+  actionButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  actionButton.click();
+
+  console.log(`[Content] Cloudflare auto-continue click (${source})`);
+  return true;
+}
+
+function removeFromActiveTimeouts(timeout) {
+  const index = activeTimeouts.indexOf(timeout);
+  if (index > -1) {
+    activeTimeouts.splice(index, 1);
+  }
+}
+
+// Override with a more robust watcher: interval + MutationObserver + verified progress check.
+function waitForCloudflareAndSubmit() {
+  if (cloudflareWatchActive) {
+    console.log('[Content] Cloudflare watcher already active, skip duplicate start');
+    return;
+  }
+
+  cloudflareWatchActive = true;
+  let submittedNotified = false;
+  let timeoutHandler = null;
+  let clickAttempts = 0;
+  let lastClickTs = 0;
+
+  const CLICK_COOLDOWN_MS = 1200;
+  const MAX_CLICK_ATTEMPTS = 12;
+
+  const notifySubmitted = () => {
+    if (submittedNotified) return;
+    submittedNotified = true;
+    chrome.runtime.sendMessage({
+      action: 'registrationSubmitted',
+      success: true
+    });
+  };
+
+  const stopWatcher = (checkInterval) => {
+    clearInterval(checkInterval);
+    removeFromActiveIntervals(checkInterval);
+    if (cloudflareObserver) {
+      cloudflareObserver.disconnect();
+      cloudflareObserver = null;
+    }
+    if (timeoutHandler) {
+      clearTimeout(timeoutHandler);
+      removeFromActiveTimeouts(timeoutHandler);
+      timeoutHandler = null;
+    }
+    cloudflareWatchActive = false;
+  };
+
+  const isGateCleared = () => {
+    // If the dedicated human-check prompt still exists, treat as not cleared.
+    if (hasHumanCheckPrompt() && findContinueLikeButton()) {
+      return false;
+    }
+
+    const markerNodes = Array.from(document.querySelectorAll(
+      '.cf-turnstile, iframe[src*="challenges.cloudflare.com"], [id*="cf-challenge"], [class*="cf-"]'
+    ));
+
+    const hasVisibleCloudflareMarker = markerNodes.some((el) => {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      return el.getClientRects().length > 0;
+    });
+
+    const hasVisibleAction = !!findCloudflareActionButton();
+
+    // Clear only when known challenge markers and continue-like actions are gone.
+    return !hasVisibleCloudflareMarker && !hasVisibleAction && !findContinueLikeButton();
+  };
+
+  const tryClickWithVerification = (source, checkInterval) => {
+    const now = Date.now();
+    if (now - lastClickTs < CLICK_COOLDOWN_MS) return;
+    if (clickAttempts >= MAX_CLICK_ATTEMPTS) return;
+
+    if (!tryAutoContinueAfterCloudflare(source)) return;
+
+    clickAttempts += 1;
+    lastClickTs = now;
+    console.log(`[Content] auto-continue attempt ${clickAttempts}/${MAX_CLICK_ATTEMPTS}`);
+
+    const verifyTimer = setTimeout(() => {
+      if (isGateCleared()) {
+        notifySubmitted();
+        stopWatcher(checkInterval);
+      } else if (clickAttempts >= MAX_CLICK_ATTEMPTS) {
+        chrome.runtime.sendMessage({
+          action: 'cloudflareWaiting',
+          message: '自动点击继续未生效，请手动点击“继续”一次'
+        });
+      }
+    }, 1000);
+
+    activeTimeouts.push(verifyTimer);
+  };
+
+  const checkInterval = setInterval(() => {
+    tryClickWithVerification('interval', checkInterval);
+  }, 400);
+  activeIntervals.push(checkInterval);
+
+  cloudflareObserver = new MutationObserver(() => {
+    tryClickWithVerification('observer', checkInterval);
+  });
+  cloudflareObserver.observe(document.documentElement || document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['class', 'style', 'disabled', 'aria-disabled']
+  });
+
+  timeoutHandler = setTimeout(() => {
+    console.log('[Content] Cloudflare taking longer than expected, keep watching...');
+    chrome.runtime.sendMessage({
+      action: 'cloudflareWaiting',
+      message: '请手动完成Cloudflare验证'
+    });
+  }, CONFIG.CLOUDFLARE_TIMEOUT);
+  activeTimeouts.push(timeoutHandler);
+
+  tryClickWithVerification('initial', checkInterval);
+}
+
+// Override cleanup to also close MutationObserver.
+function cleanupTimers() {
+  activeIntervals.forEach(interval => clearInterval(interval));
+  activeTimeouts.forEach(timeout => clearTimeout(timeout));
+  activeIntervals = [];
+  activeTimeouts = [];
+  if (cloudflareObserver) {
+    cloudflareObserver.disconnect();
+    cloudflareObserver = null;
+  }
+  cloudflareWatchActive = false;
+  console.log('[Content] 已清理所有定时器');
+}
+
 window.addEventListener('load', () => {
   const step = detectCurrentStep();
   chrome.runtime.sendMessage({
@@ -652,3 +895,51 @@ document.addEventListener('visibilitychange', () => {
     cleanupTimers();
   }
 });
+
+// --- Codex hotfix: re-arm auto continue on dedicated human-check page ---
+function __whIsHumanGatePageV2() {
+  if (hasHumanCheckPrompt() && findContinueLikeButton()) {
+    return true;
+  }
+
+  const markerNodes = Array.from(document.querySelectorAll(
+    '.cf-turnstile, iframe[src*="challenges.cloudflare.com"], [id*="cf-challenge"], [class*="cf-"]'
+  ));
+
+  const hasVisibleCloudflareMarker = markerNodes.some((el) => {
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    return el.getClientRects().length > 0;
+  });
+
+  const hasAction = (typeof findCloudflareActionButton === 'function')
+    ? !!findCloudflareActionButton()
+    : !!document.querySelector('button, [role="button"], input[type="submit"], input[type="button"]');
+
+  // Structural detection only; avoid locale/encoding dependency.
+  return hasAction && hasVisibleCloudflareMarker;
+}
+
+function __whArmCloudflareWatcherV2(source) {
+  try {
+    if (!isWindsurfRegistrationPage(window.location.href)) return;
+    if (!__whIsHumanGatePageV2()) return;
+    if (typeof waitForCloudflareAndSubmit === 'function') {
+      console.log('[Content] Arm Cloudflare auto-continue watcher from', source);
+      waitForCloudflareAndSubmit();
+    }
+  } catch (e) {
+    console.warn('[Content] Arm watcher failed:', e && e.message ? e.message : e);
+  }
+}
+
+window.addEventListener('load', () => {
+  setTimeout(() => __whArmCloudflareWatcherV2('load'), 250);
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    setTimeout(() => __whArmCloudflareWatcherV2('visible'), 100);
+  }
+});
+

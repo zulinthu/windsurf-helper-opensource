@@ -1,281 +1,374 @@
 /**
- * 临时邮箱客户端
- * 
- * 默认支持的服务商（仅作推荐）：
- *   - temp-mail.org
- *   - guerrillamail.com
- * 
- * 用户可以自行添加其他临时邮箱服务API：
- *   - 10分钟邮箱 (10minutemail.com)
- *   - 2925邮箱 (mail.2925.com)
- *   - TempMail+ (tempmail.plus)
- *   - 等等...
- * 
- * 添加方法：
- *   1. 参考现有的 generateXXX() 和 checkXXX() 方法
- *   2. 添加新的服务商实现
- *   3. 在 generateEmail() 和 checkMails() 中添加case
+ * Temporary mail client for verification code polling.
+ * Keeps a stable API surface for popup.js:
+ * - generateEmail()
+ * - waitForVerificationCode()
  */
-
 class TempMailClient {
   constructor(config = {}) {
-    this.provider = config.provider || 'temp-mail-org';
-    this.pollInterval = config.pollInterval || 5000;
-    this.maxAttempts = config.maxAttempts || 60;
+    this.provider = this.normalizeProvider(config.provider || 'tempmailplus');
+    this.pollInterval = Number(config.pollInterval || 5000);
+    this.maxAttempts = Number(config.maxAttempts || 60);
     this.currentEmail = null;
     this.currentToken = null;
   }
 
-  /**
-   * 生成临时邮箱地址
-   */
+  normalizeProvider(provider) {
+    const value = String(provider || '').trim().toLowerCase();
+    if (['guerrilla-mail', 'guerrillamail', 'guerrilla'].includes(value)) return 'guerrilla';
+    if (['1secmail', 'one-secmail'].includes(value)) return '1secmail';
+    if (['tempmailplus', 'tempmail.plus', 'temp-mail-plus'].includes(value)) return 'tempmailplus';
+    return value || 'tempmailplus';
+  }
+
+  inferProviderFromEmail(email) {
+    const domain = String(email || '').toLowerCase().split('@')[1] || '';
+    if (!domain) return null;
+    if (domain.includes('guerrillamail')) return 'guerrilla';
+    if (domain.includes('1secmail')) return '1secmail';
+    if (domain.includes('tempmail.plus')) return 'tempmailplus';
+    return null;
+  }
+
+  ensureProviderConsistency() {
+    const inferred = this.inferProviderFromEmail(this.currentEmail);
+    if (inferred && inferred !== this.provider) {
+      console.warn(`[TempMail] Provider auto-correct: ${this.provider} -> ${inferred}`);
+      this.provider = inferred;
+    }
+  }
+
+  getMailId(mail) {
+    if (!mail || typeof mail !== 'object') return null;
+    return mail.id || mail.mail_id || mail.mailId || mail.mid || null;
+  }
+
   async generateEmail() {
-    try {
-      // 根据配置选择邮箱服务商
-      switch (this.provider) {
-        case '1secmail':
-          return await this.generate1SecMail();
-        case 'guerrilla-mail':
-          return await this.generateGuerrillaMail();
-        case 'temp-mail-org':
-          // 旧方法已废弃，回退到1secmail
-          console.warn('[TempMail] temp-mail-org已废弃，使用1secmail代替');
-          return await this.generate1SecMail();
-        default:
-          throw new Error(`不支持的服务商: ${this.provider}`);
-      }
-    } catch (error) {
-      console.error('[TempMail] 生成邮箱失败:', error);
-      throw error;
+    console.log('[TempMail] Generating temporary mailbox...');
+
+    switch (this.provider) {
+      case 'tempmailplus':
+        return await this.generateTempMailPlus();
+      case 'guerrilla':
+        return await this.generateGuerrillaMail();
+      case '1secmail':
+        return await this.generate1SecMail();
+      default:
+        throw new Error(`Unsupported provider: ${this.provider}`);
     }
   }
 
-  /**
-   * 1SecMail - 生成邮箱（推荐）
-   * 官方API: https://www.1secmail.com/api/
-   */
-  async generate1SecMail() {
+  async generateTempMailPlus() {
     try {
-      console.log('[1SecMail] 正在生成邮箱...');
-      const response = await fetch('https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1');
-      
-      console.log('[1SecMail] API响应状态:', response.status, response.statusText);
-      
+      console.log('[TempMail+] Using tempmail.plus');
+      const response = await fetch('https://tempmail.plus/api/generate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0'
+        },
+        body: JSON.stringify({
+          count: 1,
+          domain: 'tempmail.plus'
+        })
+      });
+
       if (!response.ok) {
-        throw new Error(`1SecMail API返回错误: ${response.status} ${response.statusText}`);
+        throw new Error(`TempMail+ API error: ${response.status}`);
       }
-      
+
       const data = await response.json();
-      console.log('[1SecMail] API返回数据:', data);
-      
-      if (!data || !Array.isArray(data) || data.length === 0) {
-        throw new Error('1SecMail API返回数据格式错误');
+      if (!data || !data.email) {
+        throw new Error('TempMail+ response missing email');
       }
-      
-      this.currentEmail = data[0]; // 返回格式: ["abc123@1secmail.com"]
-      
-      // 分割邮箱获取 login 和 domain
-      const [login, domain] = this.currentEmail.split('@');
-      this.currentToken = JSON.stringify({ login, domain });
-      
-      console.log('[1SecMail] ✅ 邮箱生成成功:', this.currentEmail);
-      
-      return {
-        email: this.currentEmail,
-        token: this.currentToken
-      };
+
+      this.provider = 'tempmailplus';
+      this.currentEmail = data.email;
+      this.currentToken = data.email;
+
+      console.log('[TempMail+] Mailbox created:', this.currentEmail);
+      return { email: this.currentEmail, token: this.currentToken };
     } catch (error) {
-      console.error('[1SecMail] 生成邮箱失败:', error);
-      console.error('[1SecMail] 错误详情:', error.message);
-      throw new Error(`无法生成 1SecMail 邮箱: ${error.message}`);
+      console.warn('[TempMail+] Failed, fallback to Guerrilla:', error.message);
+      this.provider = 'guerrilla';
+      return await this.generateGuerrillaMail();
     }
   }
 
-  /**
-   * Guerrilla Mail - 生成邮箱
-   */
   async generateGuerrillaMail() {
     const response = await fetch('https://api.guerrillamail.com/ajax.php?f=get_email_address');
-    
     if (!response.ok) {
-      throw new Error('无法生成 Guerrilla Mail 邮箱');
+      throw new Error(`Guerrilla API error: ${response.status}`);
     }
-    
+
     const data = await response.json();
+    if (!data || !data.email_addr || !data.sid_token) {
+      throw new Error('Guerrilla response missing required fields');
+    }
+
+    this.provider = 'guerrilla';
     this.currentEmail = data.email_addr;
     this.currentToken = data.sid_token;
-    
-    return {
-      email: this.currentEmail,
-      token: this.currentToken
-    };
+
+    console.log('[Guerrilla] Mailbox created:', this.currentEmail);
+    return { email: this.currentEmail, token: this.currentToken };
   }
 
-  /**
-   * 检查邮件
-   */
-  async checkMails() {
-    if (!this.currentEmail || !this.currentToken) {
-      throw new Error('请先生成邮箱地址');
+  async generate1SecMail() {
+    const domains = ['1secmail.com', '1secmail.net', '1secmail.org'];
+    let lastError = null;
+
+    for (const domain of domains) {
+      try {
+        const apiUrl = `https://${domain}/api/v1/?action=genRandomMailbox&count=1`;
+        const response = await fetch(apiUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        if (!response.ok) continue;
+
+        const data = await response.json();
+        if (!Array.isArray(data) || data.length === 0) continue;
+
+        this.provider = '1secmail';
+        this.currentEmail = data[0];
+        this.currentToken = JSON.stringify({
+          login: this.currentEmail.split('@')[0],
+          domain: this.currentEmail.split('@')[1]
+        });
+
+        console.log('[1SecMail] Mailbox created:', this.currentEmail);
+        return { email: this.currentEmail, token: this.currentToken };
+      } catch (error) {
+        lastError = error;
+      }
     }
+
+    throw lastError || new Error('Failed to generate 1SecMail mailbox');
+  }
+
+  async checkMails() {
+    if (!this.currentEmail) {
+      throw new Error('No mailbox yet, call generateEmail() first');
+    }
+
+    this.ensureProviderConsistency();
 
     try {
       switch (this.provider) {
-        case '1secmail':
-          return await this.check1SecMail();
-        case 'guerrilla-mail':
+        case 'tempmailplus':
+          return await this.checkTempMailPlus();
+        case 'guerrilla':
           return await this.checkGuerrillaMail();
-        case 'temp-mail-org':
-          // 旧方法已废弃，回退到1secmail
+        case '1secmail':
           return await this.check1SecMail();
         default:
           return [];
       }
     } catch (error) {
-      console.error('[TempMail] 检查邮件失败:', error);
+      console.error('[TempMail] checkMails failed:', error);
       return [];
     }
   }
 
-  /**
-   * 1SecMail - 检查邮件
-   */
-  async check1SecMail() {
-    if (!this.currentToken) {
-      return [];
+  async checkTempMailPlus() {
+    this.ensureProviderConsistency();
+    if (this.provider !== 'tempmailplus') {
+      return await this.checkMails();
     }
-    
-    const { login, domain } = JSON.parse(this.currentToken);
-    const response = await fetch(
-      `https://www.1secmail.com/api/v1/?action=getMessages&login=${login}&domain=${domain}`
-    );
-    
-    if (!response.ok) {
-      return [];
-    }
-    
-    const messages = await response.json();
-    return Array.isArray(messages) ? messages : [];
-  }
 
-  /**
-   * Guerrilla Mail - 检查邮件
-   */
-  async checkGuerrillaMail() {
-    console.log('[Guerrilla] 检查邮件...');
-    console.log('[Guerrilla] 邮箱:', this.currentEmail);
-    console.log('[Guerrilla] Token:', this.currentToken);
-    
-    const url = `https://api.guerrillamail.com/ajax.php?f=check_email&seq=0&sid_token=${this.currentToken}`;
-    console.log('[Guerrilla] API请求:', url);
-    
-    const response = await fetch(url);
-    
-    console.log('[Guerrilla] API响应状态:', response.status, response.statusText);
-    
+    const response = await fetch(`https://tempmail.plus/api/messages/${encodeURIComponent(this.currentEmail)}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+
     if (!response.ok) {
-      console.error('[Guerrilla] API请求失败');
+      console.warn('[TempMail+] check messages failed:', response.status);
       return [];
     }
-    
+
     const data = await response.json();
-    console.log('[Guerrilla] API返回数据:', JSON.stringify(data, null, 2));
-    console.log('[Guerrilla] 邮件数量:', data.list ? data.list.length : 0);
-    
-    return data.list || [];
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data.messages)) return data.messages;
+    return [];
   }
 
-  /**
-   * 从邮件内容中提取验证码
-   */
-  extractVerificationCode(mailContent) {
+  async checkGuerrillaMail() {
+    const response = await fetch(
+      `https://api.guerrillamail.com/ajax.php?f=check_email&seq=0&sid_token=${encodeURIComponent(this.currentToken || '')}`
+    );
+
+    if (!response.ok) {
+      console.warn('[Guerrilla] check messages failed:', response.status);
+      return [];
+    }
+
+    const data = await response.json();
+    return Array.isArray(data.list) ? data.list : [];
+  }
+
+  async check1SecMail() {
+    if (!this.currentToken) return [];
+
+    try {
+      const { login, domain } = JSON.parse(this.currentToken);
+      const response = await fetch(
+        `https://www.1secmail.com/api/v1/?action=getMessages&login=${encodeURIComponent(login)}&domain=${encodeURIComponent(domain)}`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+
+      if (!response.ok) return [];
+      const data = await response.json();
+      return Array.isArray(data) ? data : [];
+    } catch (error) {
+      console.error('[1SecMail] check messages failed:', error);
+      return [];
+    }
+  }
+
+  async getMailContent(mailId) {
+    if (!mailId) return null;
+
+    this.ensureProviderConsistency();
+
+    switch (this.provider) {
+      case 'tempmailplus':
+        return await this.getTempMailPlusContent(mailId);
+      case 'guerrilla':
+        return await this.getGuerrillaMailContent(mailId);
+      case '1secmail':
+        return await this.get1SecMailContent(mailId);
+      default:
+        return null;
+    }
+  }
+
+  async getTempMailPlusContent(mailId) {
+    try {
+      const response = await fetch(`https://tempmail.plus/api/message/${encodeURIComponent(mailId)}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+      if (!response.ok) return null;
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async getGuerrillaMailContent(mailId) {
+    if (!this.currentToken) return null;
+
+    try {
+      const response = await fetch(
+        `https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${encodeURIComponent(mailId)}&sid_token=${encodeURIComponent(this.currentToken)}`
+      );
+      if (!response.ok) return null;
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async get1SecMailContent(mailId) {
+    if (!this.currentToken) return null;
+
+    try {
+      const { login, domain } = JSON.parse(this.currentToken);
+      const response = await fetch(
+        `https://www.1secmail.com/api/v1/?action=readMessage&login=${encodeURIComponent(login)}&domain=${encodeURIComponent(domain)}&id=${encodeURIComponent(mailId)}`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+      if (!response.ok) return null;
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+
+  extractVerificationCode(text) {
+    const content = String(text || '');
     const patterns = [
-      /(\d{6})/,
-      /Your verification code is:\s*(\d{6})/i,
-      /verification code:\s*(\d{6})/i,
-      /code is:\s*(\d{6})/i,
-      /验证码[：:]\s*(\d{6})/
+      /\b(\d{6})\b/,
+      /verification\s*code[^\d]*(\d{6})/i,
+      /code[^\d]*(\d{6})/i,
+      /验证码[^\d]*(\d{6})/i
     ];
-    
+
     for (const pattern of patterns) {
-      const match = mailContent.match(pattern);
+      const match = content.match(pattern);
       if (match && match[1]) {
         return match[1];
       }
     }
-    
+
     return null;
   }
 
-  /**
-   * 获取1SecMail邮件详细内容
-   */
-  async get1SecMailContent(mailId) {
-    const { login, domain } = JSON.parse(this.currentToken);
-    const response = await fetch(
-      `https://www.1secmail.com/api/v1/?action=readMessage&login=${login}&domain=${domain}&id=${mailId}`
+  isLikelyTargetMail(subject, from, body) {
+    const s = String(subject || '').toLowerCase();
+    const f = String(from || '').toLowerCase();
+    const b = String(body || '').toLowerCase();
+    return (
+      s.includes('windsurf') || s.includes('codeium') || s.includes('verification') ||
+      f.includes('windsurf') || f.includes('codeium') ||
+      b.includes('windsurf') || b.includes('codeium') || b.includes('verification code') || b.includes('验证码')
     );
-    
-    if (!response.ok) {
-      return null;
-    }
-    
-    return await response.json();
   }
 
-  /**
-   * 轮询等待验证码
-   */
   async waitForVerificationCode() {
+    console.log('[TempMail] Waiting for verification code...');
+
     for (let i = 0; i < this.maxAttempts; i++) {
-      console.log(`[TempMail] 第 ${i + 1}/${this.maxAttempts} 次检查...`);
-      
+      this.ensureProviderConsistency();
+      console.log(`[TempMail] Poll ${i + 1}/${this.maxAttempts}, provider=${this.provider}, email=${this.currentEmail}`);
+
       const mails = await this.checkMails();
-      console.log(`[TempMail] 收到 ${mails.length} 封邮件`);
-      
+      console.log(`[TempMail] Messages found: ${mails.length}`);
+
       for (const mail of mails) {
-        // 1SecMail需要额外获取邮件内容
         let mailContent = mail;
-        if (this.provider === '1secmail' || this.provider === 'temp-mail-org') {
-          const fullMail = await this.get1SecMailContent(mail.id);
-          if (fullMail) {
-            mailContent = fullMail;
+        const mailId = this.getMailId(mail);
+
+        if (mailId) {
+          const full = await this.getMailContent(mailId);
+          if (full && typeof full === 'object') {
+            mailContent = { ...mail, ...full };
           }
         }
-        
+
         const subject = mailContent.subject || mailContent.mail_subject || '';
-        const body = mailContent.body || mailContent.textBody || mailContent.htmlBody || mailContent.mail_body || mailContent.mail_text || '';
         const from = mailContent.from || mailContent.mail_from || '';
-        
-        console.log(`[TempMail] 检查邮件:`);
-        console.log(`  From: ${from}`);
-        console.log(`  Subject: ${subject}`);
-        console.log(`  Body (前100字): ${body.substring(0, 100)}`);
-        
-        // 检查是否来自 Windsurf
-        if (from.toLowerCase().includes('windsurf') || 
-            from.toLowerCase().includes('codeium') ||
-            subject.toLowerCase().includes('windsurf') ||
-            subject.toLowerCase().includes('verification')) {
-          
-          console.log(`[TempMail] ✅ 匹配到Windsurf邮件`);
-          const code = this.extractVerificationCode(body);
-          if (code) {
-            console.log(`[TempMail] ✅ 找到验证码: ${code}`);
+        const rawBody =
+          mailContent.body || mailContent.text || mailContent.textBody || mailContent.htmlBody ||
+          mailContent.mail_body || mailContent.mail_text || mailContent.snippet || '';
+
+        const plainBody = String(rawBody).replace(/<[^>]+>/g, ' ');
+        const combined = `${subject}\n${plainBody}`;
+        const code = this.extractVerificationCode(combined);
+
+        console.log('[TempMail] Check message:', {
+          from,
+          subject,
+          hasCode: !!code,
+          mailId
+        });
+
+        if (code) {
+          const likely = this.isLikelyTargetMail(subject, from, plainBody);
+          if (likely || mails.length === 1) {
+            console.log(`[TempMail] Verification code found: ${code}`);
             return {
               success: true,
-              code: code,
-              mail: mail
+              code,
+              mail
             };
           }
         }
       }
-      
+
       if (i < this.maxAttempts - 1) {
-        await new Promise(resolve => setTimeout(resolve, this.pollInterval));
+        await new Promise((resolve) => setTimeout(resolve, this.pollInterval));
       }
     }
-    
+
     return {
       success: false,
       error: '未能获取验证码'

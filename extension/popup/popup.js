@@ -35,36 +35,41 @@ try {
  */
 function isWindsurfRegistrationPage(url) {
   if (!url) return false;
-  
-  // 标准注册页面
-  const standardPatterns = [
-    'windsurf.com/account/register'
-  ];
-  
-  // OAuth/Onboarding注册页面
-  const oauthPatterns = [
-    'windsurf.com/windsurf/signin',
-    'workflow=onboarding',
-    'prompt=login'
-  ];
-  
-  // 检查标准注册页面
-  for (const pattern of standardPatterns) {
-    if (url.includes(pattern)) {
+
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+
+    const isSupportedHost =
+      host === 'windsurf.com' ||
+      host.endsWith('.windsurf.com') ||
+      host === 'codeium.com' ||
+      host.endsWith('.codeium.com');
+
+    if (!isSupportedHost) return false;
+
+    if (path.startsWith('/account/register')) {
       return true;
     }
-  }
-  
-  // 检查OAuth注册页面（需要同时满足多个条件）
-  let oauthMatchCount = 0;
-  for (const pattern of oauthPatterns) {
-    if (url.includes(pattern)) {
-      oauthMatchCount++;
+
+    if (path.startsWith('/windsurf/signin')) {
+      const workflow = (parsed.searchParams.get('workflow') || '').toLowerCase();
+      const prompt = (parsed.searchParams.get('prompt') || '').toLowerCase();
+      return workflow === 'onboarding' || prompt === 'login' || parsed.search.toLowerCase().includes('onboarding');
     }
+  } catch (e) {
+    // Fallback: keep compatibility for malformed URLs.
+    return (
+      url.includes('windsurf.com/account/register') ||
+      (
+        (url.includes('windsurf.com/windsurf/signin') || url.includes('codeium.com/windsurf/signin')) &&
+        (url.includes('workflow=onboarding') || url.includes('prompt=login'))
+      )
+    );
   }
-  
-  // OAuth页面需要匹配至少2个条件才认为是注册页面
-  return oauthMatchCount >= 2;
+
+  return false;
 }
 
 // 初始化
@@ -188,7 +193,11 @@ async function checkAndRestoreState() {
         if (state === RegistrationStateMachine.STATES.WAITING_VERIFICATION) {
           // 等待验证状态：启动监听并显示停止按钮
           if (!isMonitoring) {
-            startRealtimeMonitoring(metadata.email);
+            if (emailConfig && emailConfig.mode === 'temp-mail') {
+              startTempMailMonitoring(metadata.email);
+            } else {
+              startRealtimeMonitoring(metadata.email);
+            }
           }
           // 显示停止按钮
           document.getElementById('start-btn').classList.add('hidden');
@@ -425,7 +434,9 @@ async function startRegistration() {
           email: accountData.email,
           password: accountData.password,
           username: accountData.username,
-          session_id: accountData.session_id
+          session_id: accountData.session_id,
+          tempMailToken: accountData.tempMailToken,
+          tempMailProvider: tempMailClient ? tempMailClient.provider : null
         });
         await stateMachine.saveToStorage();
         
@@ -463,7 +474,9 @@ async function startRegistration() {
             
             // 转换到等待验证状态
             stateMachine.transition(RegistrationStateMachine.STATES.WAITING_VERIFICATION, {
-              email: accountData.email
+              email: accountData.email,
+              tempMailToken: accountData.tempMailToken,
+              tempMailProvider: tempMailClient ? tempMailClient.provider : null
             });
             await stateMachine.saveToStorage();
             
@@ -612,6 +625,40 @@ async function startTempMailMonitoring(email) {
   if (!tempMailClient) {
     log('❌ 临时邮箱客户端未初始化', 'error');
     return;
+  }
+
+  // Ensure client context is present after popup reload/recovery.
+  // tempMail providers like Guerrilla require token; recover from currentAccount/DB.
+  try {
+    tempMailClient.currentEmail = email;
+
+    let provider = currentAccount?.tempMailProvider || currentAccount?.temp_mail_provider || null;
+    let token = currentAccount?.tempMailToken || currentAccount?.temp_mail_token || null;
+
+    if (!token && dbManager && typeof dbManager.getAccount === 'function') {
+      const accountResult = await dbManager.getAccount(email);
+      const persisted = accountResult?.data || null;
+      if (persisted) {
+        token = persisted.tempMailToken || persisted.temp_mail_token || token;
+        provider = persisted.tempMailProvider || persisted.temp_mail_provider || provider;
+        currentAccount = { ...persisted, ...currentAccount };
+      }
+    }
+
+    if (provider) {
+      tempMailClient.provider = provider;
+    } else if (typeof tempMailClient.inferProviderFromEmail === 'function') {
+      const inferred = tempMailClient.inferProviderFromEmail(email);
+      if (inferred) tempMailClient.provider = inferred;
+    }
+
+    if (token) {
+      tempMailClient.currentToken = token;
+    }
+
+    log(`📮 监听配置: provider=${tempMailClient.provider}, token=${tempMailClient.currentToken ? 'yes' : 'no'}`);
+  } catch (hydrateError) {
+    console.warn('[TempMail] hydrate context failed:', hydrateError);
   }
   
   isMonitoring = true;
